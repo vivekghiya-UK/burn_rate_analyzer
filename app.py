@@ -1,116 +1,105 @@
 import streamlit as st
 import pandas as pd
-import openai
-import os
+from io import BytesIO
+from openai import OpenAI
 
-# --- Setup OpenAI API key ---
-openai.api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+# Initialize OpenAI client
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.set_page_config(page_title="Burn Rate & Runway Analyzer", layout="wide")
-
-st.title("🔥 Burn Rate & Runway Analyzer")
+st.title("Burn Rate & Runway Analyzer with AI Summary")
 
 st.markdown("""
-Upload an Excel file with your financial data.  
-Your file **must contain at least two columns**:
-- A **Date** column (e.g., 'Date', 'Month') with dates or monthly periods  
-- A **Cash Balance** column (e.g., 'Cash', 'Closing Cash') showing cash at period end  
-
-You can upload Excel files with multiple sheets — select the relevant sheet after upload.
-
-[Download sample file](https://github.com/vivekghiya-UK/burn_rate_analyzer/raw/main/sample_data.xlsx)  
-(You can use this to see the expected format.)
+**Instructions:**  
+- Upload an Excel file with your financial plan.  
+- Make sure it includes a date column and a cash balance column.  
+- Select the correct sheet and columns below.  
+- The app will plot cash balance over time, estimate runway, and generate an AI summary.
 """)
 
-# --- File uploader ---
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx", "xls"])
-if not uploaded_file:
-    st.info("Please upload an Excel file to continue.")
-    st.stop()
+def to_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+    processed_data = output.getvalue()
+    return processed_data
 
-# --- Load Excel sheets ---
-try:
+# Sample data for download
+sample_df = pd.DataFrame({
+    "Date": pd.date_range(start="2025-01-01", periods=6, freq='M'),
+    "Cash Balance": [100000, 85000, 70000, 55000, 40000, 25000]
+})
+
+st.download_button(
+    label="Download Sample Excel File",
+    data=to_excel(sample_df),
+    file_name="sample_burn_rate_data.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+uploaded_file = st.file_uploader("Upload Excel file", type=["xls", "xlsx"])
+
+if uploaded_file:
+    # Load Excel file
     xls = pd.ExcelFile(uploaded_file)
-except Exception as e:
-    st.error(f"Error reading Excel file: {e}")
-    st.stop()
+    sheet_names = xls.sheet_names
+    sheet = st.selectbox("Select sheet", sheet_names)
 
-sheet_name = st.selectbox("Select the sheet to analyze", xls.sheet_names)
+    df = pd.read_excel(xls, sheet_name=sheet)
 
-try:
-    df = pd.read_excel(xls, sheet_name=sheet_name)
-except Exception as e:
-    st.error(f"Error loading sheet '{sheet_name}': {e}")
-    st.stop()
+    st.write("Preview of selected sheet:")
+    st.dataframe(df.head())
 
-st.subheader("Preview of your data")
-st.dataframe(df.head())
+    # Let user pick date and cashflow columns
+    date_col = st.selectbox("Select Date column", options=df.columns)
+    cashflow_col = st.selectbox("Select Cash balance column", options=df.columns, index=1)
 
-# --- Select columns ---
-date_col = st.selectbox("Select the Date column", df.columns)
-cash_col = st.selectbox("Select the Cash Balance column", df.columns, index=1)
-
-if date_col == cash_col:
-    st.error("Date column and Cash Balance column must be different.")
-    st.stop()
-
-# --- Process data ---
-try:
-    # Convert date column to datetime
-    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-    if df[date_col].isnull().all():
-        st.error(f"None of the values in column '{date_col}' could be parsed as dates.")
+    # Validate date column parsing
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+    except Exception:
+        st.error(f"Could not parse '{date_col}' as dates. Please select a proper date column.")
         st.stop()
-except Exception as e:
-    st.error(f"Error parsing dates in '{date_col}': {e}")
-    st.stop()
 
-# Sort by date ascending
-df = df.sort_values(by=date_col).reset_index(drop=True)
+    # Sort by date just in case
+    df = df.sort_values(by=date_col)
 
-# Calculate burn rate (negative of cash balance change)
-df['cash_change'] = df[cash_col].diff()
-average_burn_rate = -df['cash_change'][1:].mean()  # exclude first NaN
+    # Plot cash balance over time
+    st.line_chart(df.set_index(date_col)[cashflow_col])
 
-if average_burn_rate <= 0:
-    st.warning("Runway estimation not available (average burn rate is zero or positive).")
-else:
-    latest_cash = df[cash_col].iloc[-1]
-    runway_months = latest_cash / average_burn_rate if average_burn_rate > 0 else None
+    # Calculate average burn rate: avg change of cash balance per period (usually monthly)
+    df['cash_diff'] = df[cashflow_col].diff()
+    avg_burn_rate = df['cash_diff'].mean()
 
-    st.markdown(f"""
-    ### Burn Rate & Runway Summary
-    - **Average Monthly Burn Rate:** £{average_burn_rate:,.2f}  
-    - **Latest Cash Balance:** £{latest_cash:,.2f}  
-    - **Estimated Runway:** {runway_months:.1f} months  
-    """)
+    st.markdown(f"**Average Burn Rate:** {avg_burn_rate:.2f} per period")
 
-# --- Plot cash balance over time ---
-st.line_chart(data=df.set_index(date_col)[cash_col], use_container_width=True)
+    if avg_burn_rate < 0:
+        current_cash = df[cashflow_col].iloc[-1]
+        runway_periods = current_cash / abs(avg_burn_rate)
+        st.markdown(f"**Estimated Runway:** {runway_periods:.1f} periods")
+    else:
+        st.warning("Runway estimation not available (average burn rate is zero or positive).")
 
-# --- AI summary option ---
-if openai.api_key:
+    # AI summary generation
     if st.button("Generate AI Summary Report"):
+        sample_data = df[[date_col, cashflow_col]].tail(10).to_string(index=False)
+        prompt = (
+            f"Analyze the following cash balance data with dates:\n{sample_data}\n"
+            "Please provide a concise financial summary including burn rate and runway insights."
+        )
+
         with st.spinner("Generating AI summary..."):
-            prompt = f"""
-            You are a financial analyst.  
-            Given the following monthly cash balance data, provide a brief summary of the cash flow situation, including insights on burn rate and runway.
-
-            Data (Date - Cash Balance):\n{df[[date_col, cash_col]].to_csv(index=False)}
-            """
-
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=250,
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful financial assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
                     temperature=0.5,
+                    max_tokens=300,
                 )
                 summary = response.choices[0].message.content.strip()
                 st.markdown("### AI Summary Report")
                 st.write(summary)
             except Exception as e:
                 st.error(f"OpenAI API error: {e}")
-else:
-    st.info("Set your OpenAI API key in Streamlit secrets or environment variables to enable AI summary.")
-
